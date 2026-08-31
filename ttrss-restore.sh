@@ -14,7 +14,7 @@
 
 set -euo pipefail
 
-VERSION="0.1"
+VERSION="0.2"
 
 usage() {
   cat <<EOF
@@ -32,19 +32,28 @@ Arguments:
                 Defaults to "all"
 
 Options:
+  -y, --yes       Assume "yes" to all confirmation prompts (non-interactive)
   -v, --version   Show version number and exit
   -h, --help      Show this help message and exit
 
 Run this from the directory that contains docker-compose.yml and .env.
-The "db" and "app" components are destructive and ask for confirmation.
+The "db" and "app" components are destructive and ask for confirmation,
+unless -y/--yes is given.
 EOF
 }
+
+ASSUME_YES=false
 
 # --- Parse options and positional args --------------------------------
 
 POSITIONAL=()
 while [ $# -gt 0 ]; do
   case "$1" in
+    -y|--yes)
+      ASSUME_YES=true
+      shift
+      continue
+      ;;
     -v|--version)
       echo "ttrss-restore.sh ${VERSION}"
       exit 0
@@ -101,6 +110,10 @@ BACKUP_DIR="$(realpath "${BACKUP_DIR}")"
 confirm() {
   local prompt="$1"
   local reply
+  if [ "${ASSUME_YES}" = true ]; then
+    echo "${prompt} Auto-confirmed (-y/--yes)."
+    return 0
+  fi
   read -r -p "${prompt} Type YES to continue: " reply
   if [ "${reply,,}" != "yes" ]; then
     echo "Aborted."
