@@ -7,7 +7,7 @@
 
 set -euo pipefail
 
-VERSION="0.2"
+VERSION="0.4"
 
 usage() {
   cat <<EOF
@@ -20,8 +20,15 @@ Usage:
   $0 [options]
 
 Options:
-  -v, --version   Show version number and exit
-  -h, --help      Show this help message and exit
+  -l, --log-level LVL Verbosity: quiet | error | verbose (default: error)
+  -v, --version        Show version number and exit
+  -h, --help           Show this help message and exit
+
+Log levels:
+  quiet    Only the final summary lines, no step-by-step progress
+  error    Step-by-step progress lines, default tool verbosity (default)
+  verbose  Step-by-step progress, plus pg_dump --verbose and tar -v
+           (lists every file/table as it's archived/dumped)
 
 Run this from the directory that contains docker-compose.yml and .env.
 Output is written to ./ttrss-backups/<timestamp>/, with image tarballs
@@ -29,8 +36,22 @@ kept once under ./ttrss-backups/images/.
 EOF
 }
 
+LOG_LEVEL="error"
+
 while [ $# -gt 0 ]; do
   case "$1" in
+    -l|--log-level)
+      LOG_LEVEL="${2:-}"
+      case "${LOG_LEVEL}" in
+        quiet|error|verbose) ;;
+        *)
+          echo "Invalid --log-level '${LOG_LEVEL}': must be quiet, error, or verbose" >&2
+          exit 1
+          ;;
+      esac
+      shift 2
+      continue
+      ;;
     -v|--version)
       echo "ttrss-backup.sh ${VERSION}"
       exit 0
@@ -46,6 +67,11 @@ while [ $# -gt 0 ]; do
       ;;
   esac
 done
+
+log_info() {
+  [ "${LOG_LEVEL}" = "quiet" ] && return 0
+  echo "$@"
+}
 
 # --- Configuration ---------------------------------------------------------
 
@@ -69,27 +95,27 @@ IMAGE_BACKUP_DIR="${BACKUP_ROOT}/images"
 
 mkdir -p "${BACKUP_DIR}"
 mkdir -p "${IMAGE_BACKUP_DIR}"
-echo "==> Backing up into ${BACKUP_DIR}"
+log_info "==> Backing up into ${BACKUP_DIR}"
 
 # --- 1. Save the old images (once — they can no longer be pulled) ---------
 
 if [ ! -f "${IMAGE_BACKUP_DIR}/ttrss-fpm-pgsql-static.tar" ]; then
-  echo "==> Saving ${OLD_APP_IMAGE}"
+  log_info "==> Saving ${OLD_APP_IMAGE}"
   docker save "${OLD_APP_IMAGE}" -o "${IMAGE_BACKUP_DIR}/ttrss-fpm-pgsql-static.tar"
 else
-  echo "==> Image tar for ttrss-fpm-pgsql-static already exists, skipping"
+  log_info "==> Image tar for ttrss-fpm-pgsql-static already exists, skipping"
 fi
 
 if [ ! -f "${IMAGE_BACKUP_DIR}/ttrss-web-nginx.tar" ]; then
-  echo "==> Saving ${OLD_WEB_IMAGE}"
+  log_info "==> Saving ${OLD_WEB_IMAGE}"
   docker save "${OLD_WEB_IMAGE}" -o "${IMAGE_BACKUP_DIR}/ttrss-web-nginx.tar"
 else
-  echo "==> Image tar for ttrss-web-nginx already exists, skipping"
+  log_info "==> Image tar for ttrss-web-nginx already exists, skipping"
 fi
 
 # --- 2. Config files ---------------------------------------------------
 
-echo "==> Backing up config files"
+log_info "==> Backing up config files"
 cp "${PROJECT_DIR}/docker-compose.yml" "${BACKUP_DIR}/docker-compose.yml.bak"
 cp "${PROJECT_DIR}/.env" "${BACKUP_DIR}/.env.bak"
 if [ -d "${PROJECT_DIR}/config.d" ]; then
@@ -98,41 +124,47 @@ fi
 
 # --- 3. Database logical dump (safe to run while ttrss is up) --------------
 
-echo "==> Dumping database from ${DB_CONTAINER}"
+log_info "==> Dumping database from ${DB_CONTAINER}"
 # shellcheck disable=SC1091
 source "${PROJECT_DIR}/.env"
+
+pg_dump_opts=(-U "${TTRSS_DB_USER}" "${TTRSS_DB_NAME}")
+[ "${LOG_LEVEL}" = "verbose" ] && pg_dump_opts=(--verbose "${pg_dump_opts[@]}")
+
 docker exec -e PGPASSWORD="${TTRSS_DB_PASS}" "${DB_CONTAINER}" \
-  pg_dump -U "${TTRSS_DB_USER}" "${TTRSS_DB_NAME}" \
+  pg_dump "${pg_dump_opts[@]}" \
   | gzip -9 > "${BACKUP_DIR}/db-dump.sql.gz"
 
 # --- 4. app volume (safe to copy live) ----------------------------------
 
-echo "==> Archiving app volume (${APP_VOLUME})"
+log_info "==> Archiving app volume (${APP_VOLUME})"
+tar_flags="czf"
+[ "${LOG_LEVEL}" = "verbose" ] && tar_flags="cvzf"
 docker run --rm \
   -v "${APP_VOLUME}:/data:ro" \
   -v "${BACKUP_DIR}:/backup" \
-  alpine tar czf /backup/app-volume.tar.gz -C /data .
+  alpine tar "${tar_flags}" /backup/app-volume.tar.gz -C /data .
 
 # --- 5. backups volume (existing periodic backups, if any) -----------------
 
-echo "==> Archiving backups volume (${BACKUPS_VOLUME})"
+log_info "==> Archiving backups volume (${BACKUPS_VOLUME})"
 docker run --rm \
   -v "${BACKUPS_VOLUME}:/data:ro" \
   -v "${BACKUP_DIR}:/backup" \
-  alpine tar czf /backup/backups-volume.tar.gz -C /data .
+  alpine tar "${tar_flags}" /backup/backups-volume.tar.gz -C /data .
 
 # --- 6. Raw db volume (optional, requires stopping db for consistency) -----
 #
 # Uncomment if you want a raw filesystem-level copy in addition to the
 # pg_dump above. This briefly stops the database container.
 #
-# echo "==> Stopping ${DB_CONTAINER} for a consistent raw volume copy"
+# log_info "==> Stopping ${DB_CONTAINER} for a consistent raw volume copy"
 # docker stop "${DB_CONTAINER}"
 # docker run --rm \
 #   -v "${DB_VOLUME}:/data:ro" \
 #   -v "${BACKUP_DIR}:/backup" \
-#   alpine tar czf /backup/db-volume-raw.tar.gz -C /data .
+#   alpine tar "${tar_flags}" /backup/db-volume-raw.tar.gz -C /data .
 # docker start "${DB_CONTAINER}"
 
-echo "==> Done. Backup stored in ${BACKUP_DIR}"
-echo "==> Old images stored in ${IMAGE_BACKUP_DIR} (kept across runs)"
+log_info "==> Done. Backup stored in ${BACKUP_DIR}"
+log_info "==> Old images stored in ${IMAGE_BACKUP_DIR} (kept across runs)"

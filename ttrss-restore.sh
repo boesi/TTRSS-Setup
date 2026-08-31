@@ -14,7 +14,7 @@
 
 set -euo pipefail
 
-VERSION="0.2"
+VERSION="0.4"
 
 usage() {
   cat <<EOF
@@ -32,9 +32,20 @@ Arguments:
                 Defaults to "all"
 
 Options:
-  -y, --yes       Assume "yes" to all confirmation prompts (non-interactive)
-  -v, --version   Show version number and exit
-  -h, --help      Show this help message and exit
+  -y, --yes           Assume "yes" to all confirmation prompts (non-interactive)
+  -l, --log-level LVL Database restore verbosity: quiet | error | verbose
+                      (default: error)
+  -v, --version       Show version number and exit
+  -h, --help          Show this help message and exit
+
+Log levels for the "db" component (maps to psql's ECHO setting):
+  quiet    Only errors and server NOTICEs, no per-statement progress output
+  error    Like quiet, but also prints the exact SQL statement that failed
+           (default)
+  verbose  Prints every SQL statement as it is executed, plus progress output
+
+The restore always stops immediately on the first database error
+(psql's ON_ERROR_STOP), regardless of log level.
 
 Run this from the directory that contains docker-compose.yml and .env.
 The "db" and "app" components are destructive and ask for confirmation,
@@ -43,6 +54,7 @@ EOF
 }
 
 ASSUME_YES=false
+LOG_LEVEL="error"
 
 # --- Parse options and positional args --------------------------------
 
@@ -52,6 +64,18 @@ while [ $# -gt 0 ]; do
     -y|--yes)
       ASSUME_YES=true
       shift
+      continue
+      ;;
+    -l|--log-level)
+      LOG_LEVEL="${2:-}"
+      case "${LOG_LEVEL}" in
+        quiet|error|verbose) ;;
+        *)
+          echo "Invalid --log-level '${LOG_LEVEL}': must be quiet, error, or verbose" >&2
+          exit 1
+          ;;
+      esac
+      shift 2
       continue
       ;;
     -v|--version)
@@ -177,10 +201,17 @@ restore_db() {
     sleep 1
   done
 
-  echo "==> Restoring dump into ${DB_CONTAINER}"
+  echo "==> Restoring dump into ${DB_CONTAINER} (log level: ${LOG_LEVEL})"
+  local psql_opts=(-v ON_ERROR_STOP=1)
+  case "${LOG_LEVEL}" in
+    quiet)   psql_opts+=(-q) ;;
+    error)   psql_opts+=(-q --set ECHO=errors) ;;
+    verbose) psql_opts+=(--set ECHO=all) ;;
+  esac
+
   gunzip -c "${BACKUP_DIR}/db-dump.sql.gz" | \
     docker exec -i -e PGPASSWORD="${TTRSS_DB_PASS}" "${DB_CONTAINER}" \
-    psql -U "${TTRSS_DB_USER}" "${TTRSS_DB_NAME}"
+    psql "${psql_opts[@]}" -U "${TTRSS_DB_USER}" "${TTRSS_DB_NAME}"
 
   echo "==> Restarting full stack"
   docker compose -f "${PROJECT_DIR}/docker-compose.yml" up -d
@@ -210,7 +241,10 @@ restore_app() {
 # --- backups volume: recreate and extract tarball ---------------------------
 
 restore_backups_volume() {
-  confirm "This will REPLACE the backups volume (${BACKUPS_VOLUME})."
+  confirm "This will STOP the backups container and REPLACE the backups volume (${BACKUPS_VOLUME})."
+
+  echo "==> Stopping backups container"
+  docker compose -f "${PROJECT_DIR}/docker-compose.yml" stop backups
 
   echo "==> Recreating backups volume"
   docker volume rm "${BACKUPS_VOLUME}" || true
@@ -221,6 +255,9 @@ restore_backups_volume() {
     -v "${BACKUPS_VOLUME}:/data" \
     -v "${BACKUP_DIR}:/backup:ro" \
     alpine tar xzf /backup/backups-volume.tar.gz -C /data
+
+  echo "==> Restarting backups container"
+  docker compose -f "${PROJECT_DIR}/docker-compose.yml" start backups
 }
 
 # --- dispatch ----------------------------------------------------------
