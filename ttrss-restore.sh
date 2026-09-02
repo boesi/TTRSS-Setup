@@ -14,7 +14,7 @@
 
 set -euo pipefail
 
-VERSION="0.4"
+VERSION="0.5"
 
 usage() {
   cat <<EOF
@@ -106,12 +106,7 @@ PROJECT_DIR="$(pwd)"
 BACKUP_DIR="${1:-}"
 COMPONENT="${2:-all}"
 IMAGE_BACKUP_DIR="${PROJECT_DIR}/ttrss-backups/images"
-
-DB_CONTAINER="ttrss-docker-db-1"
-
-DB_VOLUME="ttrss-docker_db"
-APP_VOLUME="ttrss-docker_app"
-BACKUPS_VOLUME="ttrss-docker_backups"
+COMPOSE_FILE="${PROJECT_DIR}/docker-compose.yml"
 
 if [ -z "${BACKUP_DIR}" ]; then
   usage
@@ -130,6 +125,42 @@ fi
 # relative paths against the shell's cwd the way plain file commands do —
 # a relative path here gets misread as a named volume instead.
 BACKUP_DIR="$(realpath "${BACKUP_DIR}")"
+
+# The Compose project name (and with it every default container/volume
+# name) depends on the current directory's name, not on the "ttrss-docker"
+# name from when this stack was first set up. Resolve it live instead of
+# hardcoding it, so renaming the project directory can't silently break
+# container/volume lookups.
+PROJECT_NAME=""
+resolve_project_name() {
+  [ -n "${PROJECT_NAME}" ] && return 0
+  if [ ! -f "${COMPOSE_FILE}" ]; then
+    echo "Error: ${COMPOSE_FILE} not found — restore the 'config' component first." >&2
+    exit 1
+  fi
+  PROJECT_NAME="$(docker compose -f "${COMPOSE_FILE}" config 2>/dev/null | awk '/^name:/{print $2; exit}')"
+  if [ -z "${PROJECT_NAME}" ]; then
+    echo "Error: could not determine the Compose project name from ${COMPOSE_FILE}." >&2
+    exit 1
+  fi
+}
+
+# Look up a volume's real name via Docker's own Compose labels rather than
+# guessing "<project>_<short>" ourselves — falls back to that convention
+# only if the volume doesn't exist yet (e.g. a brand-new host).
+get_volume_name() {
+  local short="$1"
+  local found
+  found="$(docker volume ls \
+    --filter "label=com.docker.compose.project=${PROJECT_NAME}" \
+    --filter "label=com.docker.compose.volume=${short}" \
+    --format '{{.Name}}' | head -n1)"
+  if [ -n "${found}" ]; then
+    echo "${found}"
+  else
+    echo "${PROJECT_NAME}_${short}"
+  fi
+}
 
 confirm() {
   local prompt="$1"
@@ -184,24 +215,35 @@ restore_config() {
 restore_db() {
   confirm "This will STOP the stack and REPLACE the current database with ${BACKUP_DIR}/db-dump.sql.gz."
 
-  echo "==> Stopping stack"
-  docker compose -f "${PROJECT_DIR}/docker-compose.yml" down
+  resolve_project_name
+  local db_volume
+  db_volume="$(get_volume_name db)"
 
-  echo "==> Removing db volume (${DB_VOLUME})"
-  docker volume rm "${DB_VOLUME}" || true
+  echo "==> Stopping stack"
+  docker compose -f "${COMPOSE_FILE}" down
+
+  echo "==> Removing db volume (${db_volume})"
+  docker volume rm "${db_volume}" || true
 
   echo "==> Starting fresh db container to reinitialize the volume"
-  docker compose -f "${PROJECT_DIR}/docker-compose.yml" up -d db
+  docker compose -f "${COMPOSE_FILE}" up -d db
 
   # shellcheck disable=SC1091
   source "${PROJECT_DIR}/.env"
 
   echo "==> Waiting for Postgres to be ready"
-  until docker exec "${DB_CONTAINER}" pg_isready -U "${TTRSS_DB_USER}" >/dev/null 2>&1; do
+  local waited=0
+  until docker compose -f "${COMPOSE_FILE}" exec -T db pg_isready -U "${TTRSS_DB_USER}" >/dev/null 2>&1; do
     sleep 1
+    waited=$((waited + 1))
+    if [ "${waited}" -ge 60 ]; then
+      echo "Error: db service did not become ready within 60s." >&2
+      echo "Check 'docker compose -f ${COMPOSE_FILE} logs db' for details." >&2
+      exit 1
+    fi
   done
 
-  echo "==> Restoring dump into ${DB_CONTAINER} (log level: ${LOG_LEVEL})"
+  echo "==> Restoring dump into the db service (log level: ${LOG_LEVEL})"
   local psql_opts=(-v ON_ERROR_STOP=1)
   case "${LOG_LEVEL}" in
     quiet)   psql_opts+=(-q) ;;
@@ -210,54 +252,62 @@ restore_db() {
   esac
 
   gunzip -c "${BACKUP_DIR}/db-dump.sql.gz" | \
-    docker exec -i -e PGPASSWORD="${TTRSS_DB_PASS}" "${DB_CONTAINER}" \
+    docker compose -f "${COMPOSE_FILE}" exec -T -e PGPASSWORD="${TTRSS_DB_PASS}" db \
     psql "${psql_opts[@]}" -U "${TTRSS_DB_USER}" "${TTRSS_DB_NAME}"
 
   echo "==> Restarting full stack"
-  docker compose -f "${PROJECT_DIR}/docker-compose.yml" up -d
+  docker compose -f "${COMPOSE_FILE}" up -d
 }
 
 # --- app volume: recreate and extract tarball -------------------------------
 
 restore_app() {
-  confirm "This will STOP the stack and REPLACE the app volume (${APP_VOLUME})."
+  resolve_project_name
+  local app_volume
+  app_volume="$(get_volume_name app)"
 
-  docker compose -f "${PROJECT_DIR}/docker-compose.yml" down
+  confirm "This will STOP the stack and REPLACE the app volume (${app_volume})."
+
+  docker compose -f "${COMPOSE_FILE}" down
 
   echo "==> Recreating app volume"
-  docker volume rm "${APP_VOLUME}" || true
-  docker volume create "${APP_VOLUME}"
+  docker volume rm "${app_volume}" || true
+  docker volume create "${app_volume}"
 
   echo "==> Extracting app-volume.tar.gz"
   docker run --rm \
-    -v "${APP_VOLUME}:/data" \
+    -v "${app_volume}:/data" \
     -v "${BACKUP_DIR}:/backup:ro" \
     alpine tar xzf /backup/app-volume.tar.gz -C /data
 
   echo "==> Restarting stack"
-  docker compose -f "${PROJECT_DIR}/docker-compose.yml" up -d
+  docker compose -f "${COMPOSE_FILE}" up -d
 }
 
 # --- backups volume: recreate and extract tarball ---------------------------
 
 restore_backups_volume() {
-  confirm "This will STOP the backups container and REPLACE the backups volume (${BACKUPS_VOLUME})."
+  resolve_project_name
+  local backups_volume
+  backups_volume="$(get_volume_name backups)"
+
+  confirm "This will STOP the backups container and REPLACE the backups volume (${backups_volume})."
 
   echo "==> Stopping backups container"
-  docker compose -f "${PROJECT_DIR}/docker-compose.yml" stop backups
+  docker compose -f "${COMPOSE_FILE}" stop backups
 
   echo "==> Recreating backups volume"
-  docker volume rm "${BACKUPS_VOLUME}" || true
-  docker volume create "${BACKUPS_VOLUME}"
+  docker volume rm "${backups_volume}" || true
+  docker volume create "${backups_volume}"
 
   echo "==> Extracting backups-volume.tar.gz"
   docker run --rm \
-    -v "${BACKUPS_VOLUME}:/data" \
+    -v "${backups_volume}:/data" \
     -v "${BACKUP_DIR}:/backup:ro" \
     alpine tar xzf /backup/backups-volume.tar.gz -C /data
 
   echo "==> Restarting backups container"
-  docker compose -f "${PROJECT_DIR}/docker-compose.yml" start backups
+  docker compose -f "${COMPOSE_FILE}" start backups
 }
 
 # --- dispatch ----------------------------------------------------------

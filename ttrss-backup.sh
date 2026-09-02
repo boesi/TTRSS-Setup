@@ -7,7 +7,7 @@
 
 set -euo pipefail
 
-VERSION="0.4"
+VERSION="0.5"
 
 usage() {
   cat <<EOF
@@ -79,17 +79,44 @@ PROJECT_DIR="$(pwd)"
 BACKUP_ROOT="${PROJECT_DIR}/ttrss-backups"
 TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
 BACKUP_DIR="${BACKUP_ROOT}/${TIMESTAMP}"
-
-DB_CONTAINER="ttrss-docker-db-1"
-APP_CONTAINER="ttrss-docker-app-1"
-
-DB_VOLUME="ttrss-docker_db"
-APP_VOLUME="ttrss-docker_app"
-BACKUPS_VOLUME="ttrss-docker_backups"
+COMPOSE_FILE="${PROJECT_DIR}/docker-compose.yml"
 
 OLD_APP_IMAGE="cthulhoo/ttrss-fpm-pgsql-static:latest"
 OLD_WEB_IMAGE="cthulhoo/ttrss-web-nginx:latest"
 IMAGE_BACKUP_DIR="${BACKUP_ROOT}/images"
+
+# The Compose project name (and with it every default container/volume
+# name) depends on the current directory's name. Resolve it live instead
+# of hardcoding it, so renaming the project directory can't silently break
+# container/volume lookups.
+if [ ! -f "${COMPOSE_FILE}" ]; then
+  echo "Error: ${COMPOSE_FILE} not found. Run this from the project directory." >&2
+  exit 1
+fi
+PROJECT_NAME="$(docker compose -f "${COMPOSE_FILE}" config 2>/dev/null | awk '/^name:/{print $2; exit}')"
+if [ -z "${PROJECT_NAME}" ]; then
+  echo "Error: could not determine the Compose project name from ${COMPOSE_FILE}." >&2
+  exit 1
+fi
+
+# Look up a volume's real name via Docker's own Compose labels rather than
+# guessing "<project>_<short>" ourselves.
+get_volume_name() {
+  local short="$1"
+  local found
+  found="$(docker volume ls \
+    --filter "label=com.docker.compose.project=${PROJECT_NAME}" \
+    --filter "label=com.docker.compose.volume=${short}" \
+    --format '{{.Name}}' | head -n1)"
+  if [ -n "${found}" ]; then
+    echo "${found}"
+  else
+    echo "${PROJECT_NAME}_${short}"
+  fi
+}
+
+APP_VOLUME="$(get_volume_name app)"
+BACKUPS_VOLUME="$(get_volume_name backups)"
 
 # --- Setup -------------------------------------------------------------
 
@@ -124,14 +151,14 @@ fi
 
 # --- 3. Database logical dump (safe to run while ttrss is up) --------------
 
-log_info "==> Dumping database from ${DB_CONTAINER}"
+log_info "==> Dumping database from the db service"
 # shellcheck disable=SC1091
 source "${PROJECT_DIR}/.env"
 
 pg_dump_opts=(-U "${TTRSS_DB_USER}" "${TTRSS_DB_NAME}")
 [ "${LOG_LEVEL}" = "verbose" ] && pg_dump_opts=(--verbose "${pg_dump_opts[@]}")
 
-docker exec -e PGPASSWORD="${TTRSS_DB_PASS}" "${DB_CONTAINER}" \
+docker compose -f "${COMPOSE_FILE}" exec -T -e PGPASSWORD="${TTRSS_DB_PASS}" db \
   pg_dump "${pg_dump_opts[@]}" \
   | gzip -9 > "${BACKUP_DIR}/db-dump.sql.gz"
 
@@ -158,13 +185,14 @@ docker run --rm \
 # Uncomment if you want a raw filesystem-level copy in addition to the
 # pg_dump above. This briefly stops the database container.
 #
-# log_info "==> Stopping ${DB_CONTAINER} for a consistent raw volume copy"
-# docker stop "${DB_CONTAINER}"
+# db_volume="$(get_volume_name db)"
+# log_info "==> Stopping db service for a consistent raw volume copy"
+# docker compose -f "${COMPOSE_FILE}" stop db
 # docker run --rm \
-#   -v "${DB_VOLUME}:/data:ro" \
+#   -v "${db_volume}:/data:ro" \
 #   -v "${BACKUP_DIR}:/backup" \
 #   alpine tar "${tar_flags}" /backup/db-volume-raw.tar.gz -C /data .
-# docker start "${DB_CONTAINER}"
+# docker compose -f "${COMPOSE_FILE}" start db
 
 log_info "==> Done. Backup stored in ${BACKUP_DIR}"
 log_info "==> Old images stored in ${IMAGE_BACKUP_DIR} (kept across runs)"
