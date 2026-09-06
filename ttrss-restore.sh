@@ -14,7 +14,7 @@
 
 set -euo pipefail
 
-VERSION="0.5"
+VERSION="0.6"
 
 usage() {
   cat <<EOF
@@ -107,6 +107,7 @@ BACKUP_DIR="${1:-}"
 COMPONENT="${2:-all}"
 IMAGE_BACKUP_DIR="${PROJECT_DIR}/ttrss-backups/images"
 COMPOSE_FILE="${PROJECT_DIR}/docker-compose.yml"
+OVERRIDE_FILE="${PROJECT_DIR}/docker-compose.override.yml"
 
 if [ -z "${BACKUP_DIR}" ]; then
   usage
@@ -131,14 +132,25 @@ BACKUP_DIR="$(realpath "${BACKUP_DIR}")"
 # name from when this stack was first set up. Resolve it live instead of
 # hardcoding it, so renaming the project directory can't silently break
 # container/volume lookups.
+#
+# Passing -f explicitly (instead of relying on Compose's default file
+# discovery) means docker-compose.override.yml is no longer picked up
+# automatically, so COMPOSE_ARGS adds it back in by hand when present.
+# This is rebuilt on every call (not cached like PROJECT_NAME) since the
+# "config" component can restore docker-compose.override.yml partway
+# through a run, e.g. during the "all" restore.
 PROJECT_NAME=""
+COMPOSE_ARGS=()
 resolve_project_name() {
-  [ -n "${PROJECT_NAME}" ] && return 0
   if [ ! -f "${COMPOSE_FILE}" ]; then
     echo "Error: ${COMPOSE_FILE} not found — restore the 'config' component first." >&2
     exit 1
   fi
-  PROJECT_NAME="$(docker compose -f "${COMPOSE_FILE}" config 2>/dev/null | awk '/^name:/{print $2; exit}')"
+  COMPOSE_ARGS=(-f "${COMPOSE_FILE}")
+  [ -f "${OVERRIDE_FILE}" ] && COMPOSE_ARGS+=(-f "${OVERRIDE_FILE}")
+
+  [ -n "${PROJECT_NAME}" ] && return 0
+  PROJECT_NAME="$(docker compose "${COMPOSE_ARGS[@]}" config 2>/dev/null | awk '/^name:/{print $2; exit}')"
   if [ -z "${PROJECT_NAME}" ]; then
     echo "Error: could not determine the Compose project name from ${COMPOSE_FILE}." >&2
     exit 1
@@ -194,19 +206,21 @@ restore_images() {
   fi
 }
 
-# --- config: docker-compose.yml, .env, config.d ----------------------------
+# --- config: .env, docker-compose.override.yml ------------------------------
+#
+# .env and docker-compose.override.yml are intentionally gitignored
+# (secrets and local-only overrides), so they're restored here.
+# docker-compose.yml and config.d are tracked in git and are not restored
+# by this script.
 
 restore_config() {
   echo "==> Restoring config files (current files saved with .pre-restore suffix)"
-  [ -f "${PROJECT_DIR}/docker-compose.yml" ] && cp "${PROJECT_DIR}/docker-compose.yml" "${PROJECT_DIR}/docker-compose.yml.pre-restore"
   [ -f "${PROJECT_DIR}/.env" ] && cp "${PROJECT_DIR}/.env" "${PROJECT_DIR}/.env.pre-restore"
-  [ -d "${PROJECT_DIR}/config.d" ] && cp -r "${PROJECT_DIR}/config.d" "${PROJECT_DIR}/config.d.pre-restore"
+  [ -f "${PROJECT_DIR}/docker-compose.override.yml" ] && cp "${PROJECT_DIR}/docker-compose.override.yml" "${PROJECT_DIR}/docker-compose.override.yml.pre-restore"
 
-  cp "${BACKUP_DIR}/docker-compose.yml.bak" "${PROJECT_DIR}/docker-compose.yml"
   cp "${BACKUP_DIR}/.env.bak" "${PROJECT_DIR}/.env"
-  if [ -d "${BACKUP_DIR}/config.d.bak" ]; then
-    rm -rf "${PROJECT_DIR}/config.d"
-    cp -r "${BACKUP_DIR}/config.d.bak" "${PROJECT_DIR}/config.d"
+  if [ -f "${BACKUP_DIR}/docker-compose.override.yml.bak" ]; then
+    cp "${BACKUP_DIR}/docker-compose.override.yml.bak" "${PROJECT_DIR}/docker-compose.override.yml"
   fi
 }
 
@@ -220,25 +234,25 @@ restore_db() {
   db_volume="$(get_volume_name db)"
 
   echo "==> Stopping stack"
-  docker compose -f "${COMPOSE_FILE}" down
+  docker compose "${COMPOSE_ARGS[@]}" down
 
   echo "==> Removing db volume (${db_volume})"
   docker volume rm "${db_volume}" || true
 
   echo "==> Starting fresh db container to reinitialize the volume"
-  docker compose -f "${COMPOSE_FILE}" up -d db
+  docker compose "${COMPOSE_ARGS[@]}" up -d db
 
   # shellcheck disable=SC1091
   source "${PROJECT_DIR}/.env"
 
   echo "==> Waiting for Postgres to be ready"
   local waited=0
-  until docker compose -f "${COMPOSE_FILE}" exec -T db pg_isready -U "${TTRSS_DB_USER}" >/dev/null 2>&1; do
+  until docker compose "${COMPOSE_ARGS[@]}" exec -T db pg_isready -U "${TTRSS_DB_USER}" >/dev/null 2>&1; do
     sleep 1
     waited=$((waited + 1))
     if [ "${waited}" -ge 60 ]; then
       echo "Error: db service did not become ready within 60s." >&2
-      echo "Check 'docker compose -f ${COMPOSE_FILE} logs db' for details." >&2
+      echo "Check 'docker compose ${COMPOSE_ARGS[*]} logs db' for details." >&2
       exit 1
     fi
   done
@@ -252,11 +266,11 @@ restore_db() {
   esac
 
   gunzip -c "${BACKUP_DIR}/db-dump.sql.gz" | \
-    docker compose -f "${COMPOSE_FILE}" exec -T -e PGPASSWORD="${TTRSS_DB_PASS}" db \
+    docker compose "${COMPOSE_ARGS[@]}" exec -T -e PGPASSWORD="${TTRSS_DB_PASS}" db \
     psql "${psql_opts[@]}" -U "${TTRSS_DB_USER}" "${TTRSS_DB_NAME}"
 
   echo "==> Restarting full stack"
-  docker compose -f "${COMPOSE_FILE}" up -d
+  docker compose "${COMPOSE_ARGS[@]}" up -d
 }
 
 # --- app volume: recreate and extract tarball -------------------------------
@@ -268,7 +282,7 @@ restore_app() {
 
   confirm "This will STOP the stack and REPLACE the app volume (${app_volume})."
 
-  docker compose -f "${COMPOSE_FILE}" down
+  docker compose "${COMPOSE_ARGS[@]}" down
 
   echo "==> Recreating app volume"
   docker volume rm "${app_volume}" || true
@@ -281,7 +295,7 @@ restore_app() {
     alpine tar xzf /backup/app-volume.tar.gz -C /data
 
   echo "==> Restarting stack"
-  docker compose -f "${COMPOSE_FILE}" up -d
+  docker compose "${COMPOSE_ARGS[@]}" up -d
 }
 
 # --- backups volume: recreate and extract tarball ---------------------------
@@ -294,7 +308,7 @@ restore_backups_volume() {
   confirm "This will STOP the backups container and REPLACE the backups volume (${backups_volume})."
 
   echo "==> Stopping backups container"
-  docker compose -f "${COMPOSE_FILE}" stop backups
+  docker compose "${COMPOSE_ARGS[@]}" stop backups
 
   echo "==> Recreating backups volume"
   docker volume rm "${backups_volume}" || true
@@ -307,7 +321,7 @@ restore_backups_volume() {
     alpine tar xzf /backup/backups-volume.tar.gz -C /data
 
   echo "==> Restarting backups container"
-  docker compose -f "${COMPOSE_FILE}" start backups
+  docker compose "${COMPOSE_ARGS[@]}" start backups
 }
 
 # --- dispatch ----------------------------------------------------------

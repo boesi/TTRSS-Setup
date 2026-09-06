@@ -7,7 +7,7 @@
 
 set -euo pipefail
 
-VERSION="0.5"
+VERSION="0.6"
 
 usage() {
   cat <<EOF
@@ -80,6 +80,7 @@ BACKUP_ROOT="${PROJECT_DIR}/ttrss-backups"
 TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
 BACKUP_DIR="${BACKUP_ROOT}/${TIMESTAMP}"
 COMPOSE_FILE="${PROJECT_DIR}/docker-compose.yml"
+OVERRIDE_FILE="${PROJECT_DIR}/docker-compose.override.yml"
 
 OLD_APP_IMAGE="cthulhoo/ttrss-fpm-pgsql-static:latest"
 OLD_WEB_IMAGE="cthulhoo/ttrss-web-nginx:latest"
@@ -93,7 +94,14 @@ if [ ! -f "${COMPOSE_FILE}" ]; then
   echo "Error: ${COMPOSE_FILE} not found. Run this from the project directory." >&2
   exit 1
 fi
-PROJECT_NAME="$(docker compose -f "${COMPOSE_FILE}" config 2>/dev/null | awk '/^name:/{print $2; exit}')"
+
+# Passing -f explicitly (instead of relying on Compose's default file
+# discovery) means docker-compose.override.yml is no longer picked up
+# automatically, so add it back in by hand when present.
+COMPOSE_ARGS=(-f "${COMPOSE_FILE}")
+[ -f "${OVERRIDE_FILE}" ] && COMPOSE_ARGS+=(-f "${OVERRIDE_FILE}")
+
+PROJECT_NAME="$(docker compose "${COMPOSE_ARGS[@]}" config 2>/dev/null | awk '/^name:/{print $2; exit}')"
 if [ -z "${PROJECT_NAME}" ]; then
   echo "Error: could not determine the Compose project name from ${COMPOSE_FILE}." >&2
   exit 1
@@ -141,12 +149,16 @@ else
 fi
 
 # --- 2. Config files ---------------------------------------------------
+#
+# .env and docker-compose.override.yml are intentionally gitignored
+# (secrets and local-only overrides), so they're backed up here.
+# docker-compose.yml and config.d are tracked in git and are not backed
+# up by this script.
 
 log_info "==> Backing up config files"
-cp "${PROJECT_DIR}/docker-compose.yml" "${BACKUP_DIR}/docker-compose.yml.bak"
 cp "${PROJECT_DIR}/.env" "${BACKUP_DIR}/.env.bak"
-if [ -d "${PROJECT_DIR}/config.d" ]; then
-  cp -r "${PROJECT_DIR}/config.d" "${BACKUP_DIR}/config.d.bak"
+if [ -f "${PROJECT_DIR}/docker-compose.override.yml" ]; then
+  cp "${PROJECT_DIR}/docker-compose.override.yml" "${BACKUP_DIR}/docker-compose.override.yml.bak"
 fi
 
 # --- 3. Database logical dump (safe to run while ttrss is up) --------------
@@ -158,7 +170,7 @@ source "${PROJECT_DIR}/.env"
 pg_dump_opts=(-U "${TTRSS_DB_USER}" "${TTRSS_DB_NAME}")
 [ "${LOG_LEVEL}" = "verbose" ] && pg_dump_opts=(--verbose "${pg_dump_opts[@]}")
 
-docker compose -f "${COMPOSE_FILE}" exec -T -e PGPASSWORD="${TTRSS_DB_PASS}" db \
+docker compose "${COMPOSE_ARGS[@]}" exec -T -e PGPASSWORD="${TTRSS_DB_PASS}" db \
   pg_dump "${pg_dump_opts[@]}" \
   | gzip -9 > "${BACKUP_DIR}/db-dump.sql.gz"
 
@@ -187,12 +199,12 @@ docker run --rm \
 #
 # db_volume="$(get_volume_name db)"
 # log_info "==> Stopping db service for a consistent raw volume copy"
-# docker compose -f "${COMPOSE_FILE}" stop db
+# docker compose "${COMPOSE_ARGS[@]}" stop db
 # docker run --rm \
 #   -v "${db_volume}:/data:ro" \
 #   -v "${BACKUP_DIR}:/backup" \
 #   alpine tar "${tar_flags}" /backup/db-volume-raw.tar.gz -C /data .
-# docker compose -f "${COMPOSE_FILE}" start db
+# docker compose "${COMPOSE_ARGS[@]}" start db
 
 log_info "==> Done. Backup stored in ${BACKUP_DIR}"
 log_info "==> Old images stored in ${IMAGE_BACKUP_DIR} (kept across runs)"
