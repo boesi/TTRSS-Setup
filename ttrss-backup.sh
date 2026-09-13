@@ -7,7 +7,7 @@
 
 set -euo pipefail
 
-VERSION="0.6"
+VERSION="0.7"
 
 usage() {
   cat <<EOF
@@ -17,7 +17,14 @@ Full backup of the ttrss-docker stack: old cthulhoo images, config files,
 a live database dump, and the app/backups volumes.
 
 Usage:
-  $0 [options]
+  $0 [options] [backup-dir]
+
+Arguments:
+  [backup-dir]  Backup root directory. Backups are written to
+                <backup-dir>/<timestamp>/, with image tarballs kept once
+                under <backup-dir>/images/.
+                Defaults to ./ttrss-backups (relative paths are resolved
+                against the current directory).
 
 Options:
   -l, --log-level LVL Verbosity: quiet | error | verbose (default: error)
@@ -31,12 +38,11 @@ Log levels:
            (lists every file/table as it's archived/dumped)
 
 Run this from the directory that contains docker-compose.yml and .env.
-Output is written to ./ttrss-backups/<timestamp>/, with image tarballs
-kept once under ./ttrss-backups/images/.
 EOF
 }
 
 LOG_LEVEL="error"
+POSITIONAL=()
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -60,13 +66,25 @@ while [ $# -gt 0 ]; do
       usage
       exit 0
       ;;
-    *)
+    -*)
       echo "Unknown option: $1" >&2
       usage
       exit 1
       ;;
+    *)
+      POSITIONAL+=("$1")
+      shift
+      continue
+      ;;
   esac
 done
+set -- "${POSITIONAL[@]}"
+
+if [ $# -gt 1 ]; then
+  echo "Error: too many positional arguments (expected at most one: backup root dir)." >&2
+  usage
+  exit 1
+fi
 
 log_info() {
   [ "${LOG_LEVEL}" = "quiet" ] && return 0
@@ -76,7 +94,14 @@ log_info() {
 # --- Configuration ---------------------------------------------------------
 
 PROJECT_DIR="$(pwd)"
-BACKUP_ROOT="${PROJECT_DIR}/ttrss-backups"
+BACKUP_ROOT="${1:-${PROJECT_DIR}/ttrss-backups}"
+# Resolve relative paths against the current directory now: Docker's -v bind
+# mounts require absolute host paths and don't resolve relative paths.
+# -m (--canonicalize-missing) keeps paths that don't exist yet valid, since
+# mkdir happens later.
+if [[ "${BACKUP_ROOT}" != /* ]]; then
+  BACKUP_ROOT="$(realpath -m "${BACKUP_ROOT}")"
+fi
 TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
 BACKUP_DIR="${BACKUP_ROOT}/${TIMESTAMP}"
 COMPOSE_FILE="${PROJECT_DIR}/docker-compose.yml"
@@ -127,6 +152,14 @@ APP_VOLUME="$(get_volume_name app)"
 BACKUPS_VOLUME="$(get_volume_name backups)"
 
 # --- Setup -------------------------------------------------------------
+
+if [ $# -eq 0 ]; then
+  echo "Warning: using default backup root '${BACKUP_ROOT}'." >&2
+  echo "         Backups stored inside the project directory can be lost when" >&2
+  echo "         the directory is recreated or removed during a migration." >&2
+  echo "         Consider passing an external directory, e.g.:" >&2
+  echo "           $0 /mnt/backups/ttrss" >&2
+fi
 
 mkdir -p "${BACKUP_DIR}"
 mkdir -p "${IMAGE_BACKUP_DIR}"

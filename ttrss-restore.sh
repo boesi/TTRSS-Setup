@@ -5,7 +5,7 @@
 # Usage:
 #   ./ttrss-restore.sh <backup-dir> [component]
 #
-# <backup-dir>  path to a timestamped folder under ttrss-backups/
+# <backup-dir>  path to a timestamped folder created by ttrss-backup.sh
 #               (e.g. ./ttrss-backups/20260825-143000)
 # [component]   optional: all | images | config | db | app | backups
 #               defaults to "all"
@@ -14,7 +14,7 @@
 
 set -euo pipefail
 
-VERSION="0.6"
+VERSION="0.7"
 
 usage() {
   cat <<EOF
@@ -26,7 +26,9 @@ Usage:
   $0 [options] <backup-dir> [component]
 
 Arguments:
-  <backup-dir>  Path to a timestamped folder under ttrss-backups/
+  <backup-dir>  Path to a timestamped folder created by ttrss-backup.sh.
+                Old image tarballs are expected alongside it, under
+                <parent-of-backup-dir>/images/.
                 (e.g. ./ttrss-backups/20260825-143000)
   [component]   all | images | config | db | app | backups
                 Defaults to "all"
@@ -105,7 +107,6 @@ set -- "${POSITIONAL[@]}"
 PROJECT_DIR="$(pwd)"
 BACKUP_DIR="${1:-}"
 COMPONENT="${2:-all}"
-IMAGE_BACKUP_DIR="${PROJECT_DIR}/ttrss-backups/images"
 COMPOSE_FILE="${PROJECT_DIR}/docker-compose.yml"
 OVERRIDE_FILE="${PROJECT_DIR}/docker-compose.override.yml"
 
@@ -126,6 +127,11 @@ fi
 # relative paths against the shell's cwd the way plain file commands do —
 # a relative path here gets misread as a named volume instead.
 BACKUP_DIR="$(realpath "${BACKUP_DIR}")"
+
+# Old image tarballs are kept once alongside the timestamped backup folders
+# (<root>/images/), so they're derived from the given backup dir's parent
+# rather than hardcoded to ./ttrss-backups/images.
+IMAGE_BACKUP_DIR="$(dirname "${BACKUP_DIR}")/images"
 
 # The Compose project name (and with it every default container/volume
 # name) depends on the current directory's name, not on the "ttrss-docker"
