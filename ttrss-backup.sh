@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
 #
-# Full backup of the ttrss-docker stack before migrating away from the
-# discontinued cthulhoo images.
+# Full backup of the ttrss-docker stack: current images, config files,
+# a live database dump, and the app/backups volumes.
 #
 # Run this from the directory that contains docker-compose.yml and .env.
 
 set -euo pipefail
 
-VERSION="0.7"
+VERSION="0.9"
 
 usage() {
   cat <<EOF
 ttrss-backup.sh ${VERSION}
 
-Full backup of the ttrss-docker stack: old cthulhoo images, config files,
+Full backup of the ttrss-docker stack: current images, config files,
 a live database dump, and the app/backups volumes.
 
 Usage:
@@ -106,9 +106,6 @@ TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
 BACKUP_DIR="${BACKUP_ROOT}/${TIMESTAMP}"
 COMPOSE_FILE="${PROJECT_DIR}/docker-compose.yml"
 OVERRIDE_FILE="${PROJECT_DIR}/docker-compose.override.yml"
-
-OLD_APP_IMAGE="cthulhoo/ttrss-fpm-pgsql-static:latest"
-OLD_WEB_IMAGE="cthulhoo/ttrss-web-nginx:latest"
 IMAGE_BACKUP_DIR="${BACKUP_ROOT}/images"
 
 # The Compose project name (and with it every default container/volume
@@ -151,6 +148,75 @@ get_volume_name() {
 APP_VOLUME="$(get_volume_name app)"
 BACKUPS_VOLUME="$(get_volume_name backups)"
 
+# --- Image helpers ------------------------------------------------------
+#
+# The images are not hardcoded: they're read from the live compose
+# configuration, so this script works with the current (supahgreg) and any
+# previous (cthulhoo) setup unchanged.
+
+# Image ref used by a compose service (e.g. "supahgreg/tt-rss:latest").
+compose_image() {
+  local service="$1"
+  docker compose "${COMPOSE_ARGS[@]}" config \
+    | awk -v svc="${service}" '
+        /^  [a-zA-Z0-9_-]+:$/ { cur=$1; sub(/:$/, "", cur) }
+        cur==svc && /^    image:/ { print $2; exit }
+      '
+}
+
+# Filesystem-safe tarball basename for an image ref:
+#   <repo>_<version>  if a real version tag exists (anything but "latest")
+#   <repo>_<date>     else, using the image's publish date as fallback
+image_tar_basename() {
+  local ref="$1"
+  local repo="${ref}"
+  local first tag version tags t_pick t_repo t_tag pick=""
+
+  # Strip a leading registry prefix (docker.io, ghcr.io, ...) so only the
+  # repo path participates in the name.
+  first="${repo%%/*}"
+  if [ "${first}" != "${repo}" ] && { [ "${first}" = "localhost" ] || [[ "${first}" == *.* || "${first}" == *:* ]]; }; then
+    repo="${repo#*/}"
+  fi
+
+  # Split off the tag; a ref without a ":tag" implies "latest".
+  tag="${repo##*:}"
+  if [ "${tag}" = "${repo}" ]; then
+    tag=""
+  else
+    repo="${repo%:*}"
+  fi
+
+  version=""
+  if [ -n "${tag}" ] && [ "${tag}" != "latest" ]; then
+    version="${tag}"
+  else
+    # Look for a real version tag on the same locally pulled image.
+    tags="$(docker image inspect "${ref}" --format '{{.RepoTags}}' 2>/dev/null || true)"
+    tags="$(printf '%s' "${tags}" | tr -d '[]' | tr ' ' '\n')"
+    while IFS= read -r t_pick; do
+      [ -z "${t_pick}" ] && continue
+      t_repo="${t_pick%%:*}"
+      [ "${t_repo}" != "${repo}" ] && continue
+      t_tag="${t_pick##*:}"
+      [ "${t_tag}" = "latest" ] && continue
+      pick="${pick}${t_tag}"$'\n'
+    done <<< "${tags}"
+    version="$(printf '%s\n' "${pick}" | sed '/^$/d' | sort -V | tail -n1 || true)"
+  fi
+
+  if [ -z "${version}" ]; then
+    # Fallback: publish date of the image (YYYY-MM-DD).
+    version="$(docker image inspect "${ref}" --format '{{.Created}}' 2>/dev/null | cut -c1-10 || true)"
+  fi
+  if [ -z "${version}" ]; then
+    echo "Error: could not determine a name for image '${ref}'." >&2
+    exit 1
+  fi
+
+  echo "${repo//\//_}_${version}"
+}
+
 # --- Setup -------------------------------------------------------------
 
 if [ $# -eq 0 ]; then
@@ -165,21 +231,31 @@ mkdir -p "${BACKUP_DIR}"
 mkdir -p "${IMAGE_BACKUP_DIR}"
 log_info "==> Backing up into ${BACKUP_DIR}"
 
-# --- 1. Save the old images (once — they can no longer be pulled) ---------
+# --- 1. Save the current images (once) -------------------------------------
+#
+# All three service images (app, web-nginx, db) are saved so a restore can
+# run fully offline. updater/backups reuse the app image. Existing tarballs
+# of the same image are skipped; old tarballs are not removed here.
 
-if [ ! -f "${IMAGE_BACKUP_DIR}/ttrss-fpm-pgsql-static.tar" ]; then
-  log_info "==> Saving ${OLD_APP_IMAGE}"
-  docker save "${OLD_APP_IMAGE}" -o "${IMAGE_BACKUP_DIR}/ttrss-fpm-pgsql-static.tar"
-else
-  log_info "==> Image tar for ttrss-fpm-pgsql-static already exists, skipping"
+log_info "==> Resolving current images from the compose configuration"
+APP_IMAGE="$(compose_image app)"
+WEB_IMAGE="$(compose_image web-nginx)"
+DB_IMAGE="$(compose_image db)"
+if [ -z "${APP_IMAGE}" ] || [ -z "${WEB_IMAGE}" ] || [ -z "${DB_IMAGE}" ]; then
+  echo "Error: could not resolve the app/web-nginx/db image from the compose configuration." >&2
+  exit 1
 fi
 
-if [ ! -f "${IMAGE_BACKUP_DIR}/ttrss-web-nginx.tar" ]; then
-  log_info "==> Saving ${OLD_WEB_IMAGE}"
-  docker save "${OLD_WEB_IMAGE}" -o "${IMAGE_BACKUP_DIR}/ttrss-web-nginx.tar"
-else
-  log_info "==> Image tar for ttrss-web-nginx already exists, skipping"
-fi
+for img in "${APP_IMAGE}" "${WEB_IMAGE}" "${DB_IMAGE}"; do
+  base="$(image_tar_basename "${img}")"
+  tar="${IMAGE_BACKUP_DIR}/${base}.tar"
+  if [ ! -f "${tar}" ]; then
+    log_info "==> Saving ${img} as ${base}.tar"
+    docker save "${img}" -o "${tar}"
+  else
+    log_info "==> Image tar ${base}.tar already exists, skipping"
+  fi
+done
 
 # --- 2. Config files ---------------------------------------------------
 #
@@ -240,4 +316,4 @@ docker run --rm \
 # docker compose "${COMPOSE_ARGS[@]}" start db
 
 log_info "==> Done. Backup stored in ${BACKUP_DIR}"
-log_info "==> Old images stored in ${IMAGE_BACKUP_DIR} (kept across runs)"
+log_info "==> Images stored in ${IMAGE_BACKUP_DIR} (kept across runs)"
